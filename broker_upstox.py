@@ -3,7 +3,7 @@ broker_upstox.py
 -----------------
 Thin wrapper around the Upstox v2 API. NO secrets are hardcoded anywhere in
 this file — api_key, api_secret, redirect_uri, and access_token are always
-passed in at call time by app.py, which reads them from Streamlit secrets.
+passed in at call time by the app, which reads them from Streamlit secrets.
 Safe to commit to GitHub as-is.
 """
 
@@ -77,7 +77,6 @@ def search_instrument_key(access_token: str, trading_symbol: str) -> str | None:
     Looks up the Upstox instrument_key for an NSE equity trading symbol
     (e.g. 'RELIANCE' -> 'NSE_EQ|INE002A01018') using Upstox's Instrument
     Search API, so you never have to hand-copy instrument_keys yourself.
-    Returns None if nothing matches.
     """
     url = f"{BASE_URL}/instruments/search"
     resp = requests.get(
