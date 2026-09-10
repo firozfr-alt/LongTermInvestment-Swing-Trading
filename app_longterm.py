@@ -1,252 +1,168 @@
 """
-app_longterm.py
-----------------
-Long-Term (1M/3M/6M momentum) dashboard across Large/Mid/Small/Micro/Penny
-cap tiers, plus a High-Momentum Swing (3-15 day) tab. Separate app from
-app.py (the Intraday/Swing regime dashboard) — same login pattern, same
-broker_upstox.py, so it reads the SAME Streamlit secrets.
+longterm_strategy.py
+---------------------
+Pure logic for the Long-Term (1M/3M/6M) and High-Momentum Swing (3-15 day)
+dashboards. No secrets, no network calls. Safe to commit to GitHub.
 
-READ THIS BEFORE TRUSTING THE OUTPUT:
-Every tab ranks by price momentum + trend + liquidity — NOT fundamentals.
-There is no reliable free live API for ROE/debt/promoter holding, so this
-dashboard cannot check those automatically. Every row carries a manual
-verification note for exactly this reason.
+IMPORTANT LIMITATION (read this before trusting the output):
+This ranks stocks by PRICE MOMENTUM, TREND, and LIQUIDITY only — all of
+which Upstox's price/volume API can actually verify live. It does NOT check
+fundamentals (ROE, debt, promoter holding, pledge %) because there is no
+reliable free live API for that data. A stock can rank #1 here purely on
+price action while having weak or even fraudulent fundamentals underneath —
+this is a documented, specific risk in penny/micro-cap stocks (inflated
+press releases, paid stock promotion, concentrated promoter ownership used
+to manipulate float). Treat every result here as a shortlist to manually
+verify on Screener.in (promoter holding trend, pledge %, debt, red flags in
+recent filings) before acting — not as a final buy signal, especially for
+the Small/Micro/Penny tiers. combine_with_fundamentals() below is the
+semi-automated bridge: you look up 4 numbers yourself, it combines them
+with the live momentum verdict into one Final Verdict.
 """
 
-import time
-import streamlit as st
 import pandas as pd
-from datetime import date, timedelta
+import numpy as np
+from ta.trend import SMAIndicator, ADXIndicator, EMAIndicator
+from ta.momentum import RSIIndicator
 
-from broker_upstox import (get_login_url, exchange_code_for_token, get_historical_candles,
-                            search_instrument_key)
-from strategy import add_daily_indicators, get_regime
-from longterm_strategy import evaluate_longterm, evaluate_high_momentum_swing
-from universe import get_index_constituents, get_penny_candidate_symbols, CAP_TIER_INDEX
+TRADING_DAYS = {"1M": 21, "3M": 63, "6M": 126}
 
-st.set_page_config(page_title="Long-Term & High-Momentum Swing — Upstox", layout="wide")
-st.title("Long-Term (1M/3M/6M) & High-Momentum Swing Dashboard")
 
-with st.sidebar:
-    st.header("Upstox Login")
-    api_key = st.secrets.get("UPSTOX_API_KEY", "") or st.text_input("API Key", type="password")
-    api_secret = st.secrets.get("UPSTOX_API_SECRET", "") or st.text_input("API Secret", type="password")
-    redirect_uri = st.secrets.get("UPSTOX_REDIRECT_URI", "") or st.text_input(
-        "Redirect URI", value="https://your-app-name.streamlit.app")
-
-    if "access_token" not in st.session_state:
-        st.session_state.access_token = None
-
-    query_params = st.query_params
-    auth_code = query_params.get("code")
-
-    if st.session_state.access_token:
-        st.success("Logged in for this session.")
-        if st.button("Log out"):
-            st.session_state.access_token = None
-            st.rerun()
-    elif auth_code and api_key and api_secret and redirect_uri:
-        try:
-            st.session_state.access_token = exchange_code_for_token(api_key, api_secret, redirect_uri, auth_code)
-            st.query_params.clear()
-            st.rerun()
-        except Exception as e:
-            st.error(f"Token exchange failed: {e}")
-    elif api_key and redirect_uri:
-        login_url = get_login_url(api_key, redirect_uri)
-        st.markdown(f"[Click here to log in to Upstox]({login_url})")
-        st.caption("You'll be redirected back here automatically after logging in.")
+def add_longterm_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["sma50"] = SMAIndicator(out["close"], 50).sma_indicator()
+    if len(out) > 60:
+        out["sma200"] = SMAIndicator(out["close"], min(200, len(out) - 1)).sma_indicator()
     else:
-        st.info("Enter API Key, API Secret, and Redirect URI to begin.")
-
-if not st.session_state.access_token:
-    st.stop()
-
-token = st.session_state.access_token
-
-if "lt_resolve_cache" not in st.session_state:
-    st.session_state.lt_resolve_cache = {}
-if "lt_index_cache" not in st.session_state:
-    st.session_state.lt_index_cache = {}
-if "lt_results" not in st.session_state:
-    st.session_state.lt_results = {}
+        out["sma200"] = np.nan
+    out["adx14"] = ADXIndicator(out["high"], out["low"], out["close"], 14).adx()
+    out["vol_sma20"] = out["volume"].rolling(20).mean()
+    return out
 
 
-def resolve_symbols(symbols):
-    resolved = []
-    for symbol in symbols:
-        if symbol in st.session_state.lt_resolve_cache:
-            key = st.session_state.lt_resolve_cache[symbol]
-        else:
-            try:
-                key = search_instrument_key(token, symbol)
-            except Exception:
-                key = None
-            st.session_state.lt_resolve_cache[symbol] = key
-            time.sleep(0.1)
-        if key:
-            resolved.append((symbol, key))
-    return resolved
+def horizon_return(df: pd.DataFrame, trading_days: int):
+    if len(df) <= trading_days:
+        return None
+    start_price = df["close"].iloc[-trading_days - 1]
+    end_price = df["close"].iloc[-1]
+    if start_price <= 0:
+        return None
+    return round((end_price / start_price - 1) * 100, 2)
 
 
-def get_cached_index(index_key):
-    if index_key not in st.session_state.lt_index_cache:
-        st.session_state.lt_index_cache[index_key] = get_index_constituents(index_key)
-    return st.session_state.lt_index_cache[index_key]
+def evaluate_longterm(df: pd.DataFrame, price_floor: float = 10, turnover_floor: float = 10_000_000) -> dict:
+    if len(df) < 25:
+        return {"Verdict": "INSUFFICIENT DATA", "1M %": None, "3M %": None, "6M %": None,
+                "Trend": None, "note": "Fewer than ~25 trading days of history"}
+
+    ind = add_longterm_indicators(df)
+    latest = ind.iloc[-1]
+
+    result = {
+        "1M %": horizon_return(df, TRADING_DAYS["1M"]),
+        "3M %": horizon_return(df, TRADING_DAYS["3M"]),
+        "6M %": horizon_return(df, TRADING_DAYS["6M"]),
+    }
+
+    liquidity_ok = bool(latest["close"] > price_floor and latest["close"] * latest["volume"] > turnover_floor)
+    trend_ok = bool(latest["close"] > latest["sma50"]) if not pd.isna(latest["sma50"]) else None
+
+    result["Trend"] = "Above 50DMA" if trend_ok else ("Below 50DMA" if trend_ok is False else "N/A")
+    result["Liquidity OK"] = liquidity_ok
+
+    returns_available = [v for v in (result["1M %"], result["3M %"], result["6M %"]) if v is not None]
+    positive_count = sum(1 for v in returns_available if v > 0)
+
+    if not liquidity_ok:
+        result["Verdict"] = "SKIP (illiquid)"
+    elif trend_ok and returns_available and positive_count == len(returns_available):
+        result["Verdict"] = "STRONG (all horizons positive, above 50DMA)"
+    elif trend_ok and returns_available and positive_count >= max(1, len(returns_available) - 1):
+        result["Verdict"] = "WATCH (mostly positive, above 50DMA)"
+    elif trend_ok is False:
+        result["Verdict"] = "AVOID (below 50DMA)"
+    else:
+        result["Verdict"] = "MIXED"
+
+    pct_above_50dma = None
+    if not pd.isna(latest["sma50"]) and latest["sma50"] > 0:
+        pct_above_50dma = round((latest["close"] / latest["sma50"] - 1) * 100, 1)
+    result["% above 50DMA"] = pct_above_50dma
+
+    if pct_above_50dma is not None and pct_above_50dma > 35:
+        result["note"] = (f"Trading {pct_above_50dma}% above its 50DMA — extended/possible pump shape, "
+                           "verify manually before chasing, don't buy the spike")
+    else:
+        result["note"] = "Verify promoter holding/pledge/debt on Screener.in before acting"
+
+    return result
 
 
-NSE_LIMITATION_NOTE = (
-    "If this fails, NSE is blocking the request from this server (common on cloud "
-    "hosts) — this is an NSE-side block, not a bug here."
-)
+def evaluate_high_momentum_swing(df: pd.DataFrame, price_floor: float = 10) -> dict:
+    if len(df) < 25:
+        return {"Signal": "INSUFFICIENT DATA"}
 
+    out = df.copy()
+    out["ema20"] = EMAIndicator(out["close"], 20).ema_indicator()
+    out["ema50"] = EMAIndicator(out["close"], 50).ema_indicator()
+    out["adx14"] = ADXIndicator(out["high"], out["low"], out["close"], 14).adx()
+    out["rsi14"] = RSIIndicator(out["close"], 14).rsi()
+    out["vol_sma20"] = out["volume"].rolling(20).mean()
+    out["high_20"] = out["close"].rolling(20).max()
 
-def run_longterm_scan(tier_name, price_floor, turnover_floor, price_ceiling=None):
-    with st.spinner(f"Fetching {tier_name} universe..."):
-        try:
-            if tier_name == "Penny":
-                symbols = get_penny_candidate_symbols()
-            else:
-                symbols = get_cached_index(CAP_TIER_INDEX[tier_name])
-        except Exception as e:
-            st.error(f"Could not fetch {tier_name} list from NSE: {e}\n\n{NSE_LIMITATION_NOTE}")
-            return
+    r = out.iloc[-1]
+    if pd.isna(r["ema50"]) or pd.isna(r["adx14"]):
+        return {"Signal": "INSUFFICIENT DATA"}
 
-    with st.spinner(f"Resolving {len(symbols)} instrument keys..."):
-        resolved = resolve_symbols(symbols)
-
-    today = date.today().isoformat()
-    seven_months_ago = (date.today() - timedelta(days=220)).isoformat()
-
-    rows = []
-    progress = st.progress(0, text=f"Scanning {tier_name}...")
-    for i, (name, key) in enumerate(resolved):
-        try:
-            df = get_historical_candles(token, key, "day", seven_months_ago, today)
-            latest_close = df["close"].iloc[-1] if len(df) else None
-
-            if tier_name == "Penny" and (latest_close is None or latest_close > price_ceiling):
-                progress.progress((i + 1) / len(resolved))
-                continue
-
-            result = evaluate_longterm(df, price_floor, turnover_floor)
-        except Exception as e:
-            result = {"Verdict": "ERROR", "note": f"Error: {e}"}
-        result["Stock"] = name
-        rows.append(result)
-        time.sleep(0.05)
-        progress.progress((i + 1) / len(resolved))
-    progress.empty()
-
-    df_out = pd.DataFrame(rows)
-    if not df_out.empty:
-        verdict_order = {"STRONG (all horizons positive, above 50DMA)": 0, "WATCH (mostly positive, above 50DMA)": 1,
-                          "MIXED": 2, "AVOID (below 50DMA)": 3, "SKIP (illiquid)": 4,
-                          "INSUFFICIENT DATA": 5, "ERROR": 6}
-        df_out["_sort"] = df_out["Verdict"].map(verdict_order).fillna(9)
-        if "3M %" in df_out.columns:
-            df_out = df_out.sort_values(["_sort", "3M %"], ascending=[True, False]).drop(columns="_sort")
-        else:
-            df_out = df_out.sort_values(["_sort"], ascending=[True]).drop(columns="_sort")
-        cols = ["Stock", "Verdict", "1M %", "3M %", "6M %", "Trend", "% above 50DMA",
-                "Liquidity OK", "note"]
-        cols = [c for c in cols if c in df_out.columns]
-        df_out = df_out[cols]
-    st.session_state.lt_results[tier_name] = df_out
-
-
-tab_large, tab_mid, tab_small, tab_micro, tab_penny, tab_swing = st.tabs(
-    ["Large Cap", "Mid Cap", "Small Cap", "Micro Cap", "Penny", "Swing (3-15D High Momentum)"])
-
-LONGTERM_HELP = (
-    "Ranks by 1M/3M/6M price momentum, 50DMA trend, and liquidity — NOT fundamentals "
-    "(no live free API for ROE/debt/promoter holding exists). Verify fundamentals on "
-    "Screener.in before acting on anything shown here, especially Small/Micro/Penny."
-)
-
-for tier_name, tab in [("Large Cap", tab_large), ("Mid Cap", tab_mid), ("Small Cap", tab_small),
-                       ("Micro Cap", tab_micro), ("Penny", tab_penny)]:
-    with tab:
-        st.caption(LONGTERM_HELP)
-        c1, c2 = st.columns(2)
-        price_floor = c1.number_input("Min price (Rs.)", value=10.0, key=f"pf_{tier_name}")
-        turnover_floor = c2.number_input("Min daily turnover (Rs.)", value=10_000_000, key=f"tf_{tier_name}")
-        price_ceiling = None
-        if tier_name == "Penny":
-            price_ceiling = st.number_input("Penny price ceiling (Rs.)", value=30.0, key="penny_ceiling")
-
-        if st.button(f"Scan {tier_name}", key=f"scan_{tier_name}"):
-            run_longterm_scan(tier_name, price_floor, turnover_floor, price_ceiling)
-
-        if tier_name in st.session_state.lt_results:
-            st.dataframe(st.session_state.lt_results[tier_name], hide_index=True, use_container_width=True)
-        else:
-            st.info(f"Click 'Scan {tier_name}' to run this tier.")
-
-with tab_swing:
-    st.caption(
-        "3-15 day hold, high-momentum setup: EMA20>EMA50, ADX>25, RSI 60-75, "
-        "1.5x volume, within 5% of its own 20-day high. Same fundamentals "
-        "caveat applies — this is price/volume only."
+    triggered = bool(
+        r["close"] > r["ema20"] > r["ema50"] and r["adx14"] > 25 and 60 < r["rsi14"] < 75
+        and r["volume"] > 1.5 * r["vol_sma20"] and r["close"] >= 0.95 * r["high_20"]
+        and r["close"] > price_floor
     )
-    swing_universe = st.multiselect(
-        "Universe to scan", ["Large Cap", "Mid Cap", "Small Cap", "Micro Cap"],
-        default=["Large Cap", "Mid Cap"], key="swing_universe")
-    price_floor_sw = st.number_input("Min price (Rs.)", value=10.0, key="pf_swing")
+    return {
+        "Signal": "BUY (high momentum)" if triggered else "NO SIGNAL",
+        "RSI": round(r["rsi14"], 1) if not pd.isna(r["rsi14"]) else None,
+        "ADX": round(r["adx14"], 1) if not pd.isna(r["adx14"]) else None,
+        "note": "Hold 3-15 days; hard time-exit on day 15 if no target/stop hit" if triggered else "",
+    }
 
-    if st.button("Scan for High-Momentum Swing setups"):
-        with st.spinner("Checking market regime..."):
-            try:
-                today = date.today().isoformat()
-                year_ago = (date.today() - timedelta(days=400)).isoformat()
-                nifty_daily = get_historical_candles(token, "NSE_INDEX|Nifty 50", "day", year_ago, today)
-                nifty_daily = add_daily_indicators(nifty_daily)
-                regime = get_regime(nifty_daily)
-            except Exception as e:
-                st.error(f"Could not fetch Nifty data: {e}")
-                st.stop()
-        st.metric("Market Regime", regime.replace("_", " ").title())
-        if regime == "high_vol_avoid":
-            st.warning("Regime is High-Vol-Avoid — momentum crash risk is elevated right now "
-                       "(crowded winners are most vulnerable in volatile/reversing markets). "
-                       "Results below are shown for reference; consider skipping new entries.")
 
-        symbols = []
-        for tier in swing_universe:
-            try:
-                symbols += get_cached_index(CAP_TIER_INDEX[tier])
-            except Exception as e:
-                st.error(f"Could not fetch {tier}: {e}")
-        symbols = list(dict.fromkeys(symbols))
+def combine_with_fundamentals(momentum_result: dict, promoter_holding: float, pledge_pct: float,
+                               debt_equity: float, growth_positive: bool,
+                               promoter_floor: float = 35, pledge_ceiling: float = 5,
+                               de_ceiling: float = 1.0) -> dict:
+    """
+    momentum_result: the dict returned by evaluate_longterm() for this stock.
+    The other four args: numbers you looked up yourself on Screener.in.
+    Returns momentum_result with 'Final Verdict' and 'Fundamentals Pass' added.
+    """
+    fundamentals_pass = bool(
+        promoter_holding >= promoter_floor
+        and pledge_pct <= pledge_ceiling
+        and debt_equity <= de_ceiling
+        and growth_positive
+    )
 
-        resolved = resolve_symbols(symbols)
-        today = date.today().isoformat()
-        four_months_ago = (date.today() - timedelta(days=130)).isoformat()
+    mom_verdict = momentum_result.get("Verdict", "")
+    extended = (momentum_result.get("% above 50DMA") or 0) > 35
 
-        rows = []
-        progress = st.progress(0, text="Scanning for high-momentum setups...")
-        for i, (name, key) in enumerate(resolved):
-            try:
-                df = get_historical_candles(token, key, "day", four_months_ago, today)
-                result = evaluate_high_momentum_swing(df, price_floor_sw)
-            except Exception as e:
-                result = {"Signal": "ERROR", "note": f"Error: {e}"}
-            result["Stock"] = name
-            rows.append(result)
-            time.sleep(0.05)
-            progress.progress((i + 1) / max(len(resolved), 1))
-        progress.empty()
-
-        df_swing = pd.DataFrame(rows)
-        if not df_swing.empty:
-            df_swing = df_swing[df_swing["Signal"] == "BUY (high momentum)"].reset_index(drop=True)
-            cols = ["Stock", "Signal", "RSI", "ADX", "note"]
-            cols = [c for c in cols if c in df_swing.columns]
-            df_swing = df_swing[cols] if cols else df_swing
-        st.session_state.swing_hm_results = df_swing
-
-    if "swing_hm_results" in st.session_state:
-        if st.session_state.swing_hm_results.empty:
-            st.info("No high-momentum setups triggered right now.")
+    if mom_verdict in ("SKIP (illiquid)", "INSUFFICIENT DATA", "ERROR"):
+        final = f"AVOID ({mom_verdict})"
+    elif mom_verdict == "STRONG (all horizons positive, above 50DMA)":
+        if not fundamentals_pass:
+            final = "AVOID (fails fundamentals despite strong price action)"
+        elif extended:
+            final = "WATCH (fundamentals OK, but price extended — wait for a pullback)"
         else:
-            st.dataframe(st.session_state.swing_hm_results, hide_index=True, use_container_width=True)
+            final = "BUY"
+    elif mom_verdict == "WATCH (mostly positive, above 50DMA)" or mom_verdict == "MIXED":
+        final = "WATCH (fundamentals OK, momentum not fully confirmed)" if fundamentals_pass else "AVOID"
+    elif mom_verdict == "AVOID (below 50DMA)":
+        final = "WATCH (fundamentals OK, but downtrend — wait for reversal)" if fundamentals_pass else "AVOID"
+    else:
+        final = "AVOID"
+
+    out = dict(momentum_result)
+    out["Fundamentals Pass"] = fundamentals_pass
+    out["Final Verdict"] = final
+    return out
