@@ -1,4 +1,4 @@
-"""
+""
 universe.py
 -----------
 Fetches index constituent lists LIVE from NSE's own published CSV files.
