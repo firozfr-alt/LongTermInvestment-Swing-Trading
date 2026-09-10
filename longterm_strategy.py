@@ -15,7 +15,9 @@ press releases, paid stock promotion, concentrated promoter ownership used
 to manipulate float). Treat every result here as a shortlist to manually
 verify on Screener.in (promoter holding trend, pledge %, debt, red flags in
 recent filings) before acting — not as a final buy signal, especially for
-the Small/Micro/Penny tiers.
+the Small/Micro/Penny tiers. combine_with_fundamentals() below is the
+semi-automated bridge: you look up 4 numbers yourself, it combines them
+with the live momentum verdict into one Final Verdict.
 """
 
 import pandas as pd
@@ -27,7 +29,6 @@ TRADING_DAYS = {"1M": 21, "3M": 63, "6M": 126}
 
 
 def add_longterm_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """df = daily OHLCV, at least ~130 trading days for the 6M lookback to work."""
     out = df.copy()
     out["sma50"] = SMAIndicator(out["close"], 50).sma_indicator()
     if len(out) > 60:
@@ -40,7 +41,6 @@ def add_longterm_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def horizon_return(df: pd.DataFrame, trading_days: int):
-    """% price return over the given number of trading days. None if not enough history."""
     if len(df) <= trading_days:
         return None
     start_price = df["close"].iloc[-trading_days - 1]
@@ -51,12 +51,6 @@ def horizon_return(df: pd.DataFrame, trading_days: int):
 
 
 def evaluate_longterm(df: pd.DataFrame, price_floor: float = 10, turnover_floor: float = 10_000_000) -> dict:
-    """
-    Returns 1M/3M/6M returns, a trend flag, a liquidity flag, and a plain
-    Verdict. df must be daily OHLCV with enough history for the horizons
-    you care about (6M needs ~130+ trading days; fewer is fine, that
-    horizon just won't be computable for a recently-listed stock).
-    """
     if len(df) < 25:
         return {"Verdict": "INSUFFICIENT DATA", "1M %": None, "3M %": None, "6M %": None,
                 "Trend": None, "note": "Fewer than ~25 trading days of history"}
@@ -90,11 +84,6 @@ def evaluate_longterm(df: pd.DataFrame, price_floor: float = 10, turnover_floor:
     else:
         result["Verdict"] = "MIXED"
 
-    # Flag overextension: a stock trading far above its own 50DMA is the
-    # classic shape of a recent pump, regardless of which horizon you look
-    # at (a recent spike inflates 1M/3M/6M returns alike, since they all
-    # end "today" — so comparing horizons against each other doesn't catch
-    # it; distance from the 50DMA does).
     pct_above_50dma = None
     if not pd.isna(latest["sma50"]) and latest["sma50"] > 0:
         pct_above_50dma = round((latest["close"] / latest["sma50"] - 1) * 100, 1)
@@ -110,13 +99,6 @@ def evaluate_longterm(df: pd.DataFrame, price_floor: float = 10, turnover_floor:
 
 
 def evaluate_high_momentum_swing(df: pd.DataFrame, price_floor: float = 10) -> dict:
-    """
-    3-15 day hold, high-momentum swing setup: EMA20 > EMA50 stack (200DMA
-    intentionally not required — many small/micro stocks don't have 200
-    days of history), ADX>25 trend strength, RSI 60-75 momentum band
-    (avoids both weak momentum and already-overextended >75 readings),
-    volume >1.5x average, price within 5% of its own 20-day high.
-    """
     if len(df) < 25:
         return {"Signal": "INSUFFICIENT DATA"}
 
@@ -133,11 +115,8 @@ def evaluate_high_momentum_swing(df: pd.DataFrame, price_floor: float = 10) -> d
         return {"Signal": "INSUFFICIENT DATA"}
 
     triggered = bool(
-        r["close"] > r["ema20"] > r["ema50"]
-        and r["adx14"] > 25
-        and 60 < r["rsi14"] < 75
-        and r["volume"] > 1.5 * r["vol_sma20"]
-        and r["close"] >= 0.95 * r["high_20"]
+        r["close"] > r["ema20"] > r["ema50"] and r["adx14"] > 25 and 60 < r["rsi14"] < 75
+        and r["volume"] > 1.5 * r["vol_sma20"] and r["close"] >= 0.95 * r["high_20"]
         and r["close"] > price_floor
     )
     return {
@@ -146,3 +125,44 @@ def evaluate_high_momentum_swing(df: pd.DataFrame, price_floor: float = 10) -> d
         "ADX": round(r["adx14"], 1) if not pd.isna(r["adx14"]) else None,
         "note": "Hold 3-15 days; hard time-exit on day 15 if no target/stop hit" if triggered else "",
     }
+
+
+def combine_with_fundamentals(momentum_result: dict, promoter_holding: float, pledge_pct: float,
+                               debt_equity: float, growth_positive: bool,
+                               promoter_floor: float = 35, pledge_ceiling: float = 5,
+                               de_ceiling: float = 1.0) -> dict:
+    """
+    momentum_result: the dict returned by evaluate_longterm() for this stock.
+    The other four args: numbers you looked up yourself on Screener.in.
+    Returns momentum_result with 'Final Verdict' and 'Fundamentals Pass' added.
+    """
+    fundamentals_pass = bool(
+        promoter_holding >= promoter_floor
+        and pledge_pct <= pledge_ceiling
+        and debt_equity <= de_ceiling
+        and growth_positive
+    )
+
+    mom_verdict = momentum_result.get("Verdict", "")
+    extended = (momentum_result.get("% above 50DMA") or 0) > 35
+
+    if mom_verdict in ("SKIP (illiquid)", "INSUFFICIENT DATA", "ERROR"):
+        final = f"AVOID ({mom_verdict})"
+    elif mom_verdict == "STRONG (all horizons positive, above 50DMA)":
+        if not fundamentals_pass:
+            final = "AVOID (fails fundamentals despite strong price action)"
+        elif extended:
+            final = "WATCH (fundamentals OK, but price extended — wait for a pullback)"
+        else:
+            final = "BUY"
+    elif mom_verdict == "WATCH (mostly positive, above 50DMA)" or mom_verdict == "MIXED":
+        final = "WATCH (fundamentals OK, momentum not fully confirmed)" if fundamentals_pass else "AVOID"
+    elif mom_verdict == "AVOID (below 50DMA)":
+        final = "WATCH (fundamentals OK, but downtrend — wait for reversal)" if fundamentals_pass else "AVOID"
+    else:
+        final = "AVOID"
+
+    out = dict(momentum_result)
+    out["Fundamentals Pass"] = fundamentals_pass
+    out["Final Verdict"] = final
+    return out
