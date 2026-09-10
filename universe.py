@@ -1,7 +1,19 @@
-""
+"""
 universe.py
 -----------
-Fetches index constituent lists LIVE from NSE's own published CSV files.
+Fetches index constituent lists (Nifty 50, Nifty Next 50, Bank Nifty) LIVE
+from NSE's own published CSV files, instead of hardcoding a stock list here.
+
+Why not hardcode the 150 symbols? Index constituents change every 6 months
+(NSE reconstitution). A hardcoded list in this file would silently go stale
+and you'd be scanning stocks that got removed from the index, or missing
+ones that got added. Fetching live keeps it always correct.
+
+Known limitation: NSE's site sometimes blocks requests that don't look like
+a real browser, and occasionally blocks cloud-hosted IPs (including
+Streamlit Community Cloud) outright. If get_index_constituents() raises an
+error, that's NSE blocking the request, not a bug in this code — fall back
+to typing symbols manually in the app's watchlist box in that case.
 """
 
 import requests
