@@ -15,7 +15,7 @@ INDEX_CSV_URLS = {
     "nifty100": "https://nsearchives.nseindia.com/content/indices/ind_nifty100list.csv",
     "niftymidcap150": "https://nsearchives.nseindia.com/content/indices/ind_niftymidcap150list.csv",
     "niftysmallcap250": "https://nsearchives.nseindia.com/content/indices/ind_niftysmallcap250list.csv",
-    "niftymicrocap250": "https://nsearchives.nseindia.com/content/indices/ind_niftymicrocap250list.csv",
+    "niftymicrocap250": "https://nsearchives.nseindia.com/content/indices/ind_niftymicrocap250_list.csv",
 }
 
 
