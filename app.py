@@ -2,7 +2,8 @@
 app.py
 ------
 Long-Term (1M/3M/6M momentum) dashboard across Large/Mid/Small/Micro/Penny
-cap tiers, plus a High-Momentum Swing (3-15 day) tab.
+cap tiers, plus a High-Momentum Swing (3-15 day) tab, plus a per-stock
+fundamentals check that produces a final BUY/WATCH/AVOID verdict.
 """
 
 import time
@@ -13,7 +14,7 @@ from datetime import date, timedelta
 from broker_upstox import (get_login_url, exchange_code_for_token, get_historical_candles,
                             search_instrument_key)
 from strategy import add_daily_indicators, get_regime
-from longterm_strategy import evaluate_longterm, evaluate_high_momentum_swing
+from longterm_strategy import evaluate_longterm, evaluate_high_momentum_swing, combine_with_fundamentals
 from universe import get_index_constituents, get_penny_candidate_symbols, CAP_TIER_INDEX
 
 st.set_page_config(page_title="Long-Term & High-Momentum Swing — Upstox", layout="wide")
@@ -62,6 +63,8 @@ if "lt_index_cache" not in st.session_state:
     st.session_state.lt_index_cache = {}
 if "lt_results" not in st.session_state:
     st.session_state.lt_results = {}
+if "final_verdicts" not in st.session_state:
+    st.session_state.final_verdicts = {}
 
 
 def resolve_symbols(symbols):
@@ -147,6 +150,31 @@ def run_longterm_scan(tier_name, price_floor, turnover_floor, price_ceiling=None
     st.session_state.lt_results[tier_name] = df_out
 
 
+def fundamentals_panel(tier_name: str, df_tier: pd.DataFrame):
+    """Screener.in link + manual fundamentals entry -> combined Final Verdict, for one stock."""
+    if df_tier is None or df_tier.empty:
+        return
+    st.markdown("##### Check fundamentals for one stock")
+    stock = st.selectbox("Pick a stock from the results above", df_tier["Stock"].tolist(), key=f"pick_{tier_name}")
+    screener_url = f"https://www.screener.in/company/{stock}/"
+    st.markdown(f"[Open {stock} on Screener.in]({screener_url}) — check promoter holding, pledge %, D/E, and growth")
+
+    c1, c2, c3 = st.columns(3)
+    promoter_holding = c1.number_input("Promoter holding %", min_value=0.0, max_value=100.0,
+                                        value=40.0, key=f"ph_{tier_name}_{stock}")
+    pledge_pct = c2.number_input("Pledge %", min_value=0.0, max_value=100.0,
+                                  value=0.0, key=f"pl_{tier_name}_{stock}")
+    debt_equity = c3.number_input("Debt/Equity", min_value=0.0, value=0.5, key=f"de_{tier_name}_{stock}")
+    growth_positive = st.checkbox("Sales/profit growth positive (recent quarters)",
+                                   value=True, key=f"gr_{tier_name}_{stock}")
+
+    if st.button(f"Get Final Verdict for {stock}", key=f"fv_{tier_name}_{stock}"):
+        row = df_tier[df_tier["Stock"] == stock].iloc[0].to_dict()
+        combined = combine_with_fundamentals(row, promoter_holding, pledge_pct, debt_equity, growth_positive)
+        st.session_state.final_verdicts.setdefault(tier_name, {})[stock] = combined
+        st.success(f"{stock}: {combined['Final Verdict']}")
+
+
 tab_large, tab_mid, tab_small, tab_micro, tab_penny, tab_swing = st.tabs(
     ["Large Cap", "Mid Cap", "Small Cap", "Micro Cap", "Penny", "Swing (3-15D High Momentum)"])
 
@@ -171,7 +199,14 @@ for tier_name, tab in [("Large Cap", tab_large), ("Mid Cap", tab_mid), ("Small C
             run_longterm_scan(tier_name, price_floor, turnover_floor, price_ceiling)
 
         if tier_name in st.session_state.lt_results:
-            st.dataframe(st.session_state.lt_results[tier_name], hide_index=True, use_container_width=True)
+            df_display = st.session_state.lt_results[tier_name].copy()
+            tier_verdicts = st.session_state.final_verdicts.get(tier_name, {})
+            if not df_display.empty:
+                df_display["Final Verdict"] = df_display["Stock"].map(
+                    lambda s: tier_verdicts.get(s, {}).get("Final Verdict", ""))
+            st.dataframe(df_display, hide_index=True, use_container_width=True)
+            st.divider()
+            fundamentals_panel(tier_name, st.session_state.lt_results[tier_name])
         else:
             st.info(f"Click 'Scan {tier_name}' to run this tier.")
 
